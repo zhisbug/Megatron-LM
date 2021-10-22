@@ -62,7 +62,8 @@ def forward_step(forward_step_func, data_iterator, model, input_tensor, losses_r
         input_tensor = [input_tensor]
         unwrap_output_tensor = True
 
-    unwrapped_model.set_input_tensor(input_tensor)
+    if input_tensor is not None:
+        unwrapped_model.set_input_tensor(input_tensor)
     output_tensor, loss_func = forward_step_func(data_iterator, model)
     if mpu.is_pipeline_last_stage():
         output_tensor = loss_func(output_tensor)
@@ -544,6 +545,8 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
     recv_tensor_shapes = get_tensor_shapes(rank-1, model_type)
     send_tensor_shapes = get_tensor_shapes(rank, model_type)
 
+    # num_warmup_microbatches = 0
+    # num_microbatches_remaining = num_microbatches - num_warmup_microbatches
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
@@ -552,12 +555,19 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
         output_tensors = []
     losses_reduced = []
 
+    rank = torch.distributed.get_rank()
+    target_rank = 0
+
+    # print(">>>> rank {}, num_warmup_microbatches {}, num_microbatches_remaining {}...\n".
+    #       format(rank, num_warmup_microbatches, num_microbatches_remaining))
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
+        # print(">>>> rank {}, shape: {}..".format(rank, output_tensor.shape))
         send_forward(output_tensor, send_tensor_shapes, timers=timers)
+        # print(">>>> rank {}, send forward value: {}...".format(rank, output_tensor[0, 0]))
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -568,6 +578,8 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
     # receive this tensor here.
     if num_microbatches_remaining > 0:
         input_tensor = recv_forward(recv_tensor_shapes, timers=timers)
+        # print(">>>> rank {}, shape: {}..".format(rank, input_tensor.shape))
+        # print(">>>> rank {}, recv input value: {}...".format(rank, input_tensor[0, 0]))
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -575,6 +587,7 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
         output_tensor = forward_step(forward_step_func, data_iterator, model,
                                      input_tensor, losses_reduced)
+        # print(">>>> rank {}, output tensor shape outside: {}..".format(rank, output_tensor.shape))
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, timers=timers)
 
@@ -587,19 +600,23 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
                                            send_tensor_shapes,
                                            timers=timers)
 
+            # print(">>>> rank {}, output tensor grad: {}.".format(rank, output_tensor_grad))
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-
+            # print(">>>> rank {}, input tensor list: {}, output tensor list: {}.."
+            #       .format(rank, input_tensors, output_tensors))
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
+            # print(">>>>>> rank: {}, optimizer: {}, input_tensor: {}.".format(rank, optimizer, input_tensor))
+
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
                               output_tensor_grad)
-
+            # print(">>>>>> rank: {}, input tensor grad: {}.".format(rank, input_tensor_grad[0, 0]))
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
@@ -614,7 +631,10 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
+            # print(">>>>>> rank {}, before, input tensor: {}, output tensor: {}...."
+            #       .format(rank, input_tensor, output_tensor))
             output_tensor_grad = recv_backward(send_tensor_shapes, timers=timers)
+            # print(">>>>>> rank {},after output_tensor_grad {}....".format(rank, output_tensor_grad[0, 0]))
 
             input_tensor_grad = \
                 backward_step(optimizer, input_tensor, output_tensor,
@@ -622,4 +642,5 @@ def forward_backward_pipelining_without_interleaving(forward_step_func, data_ite
 
             send_backward(input_tensor_grad, recv_tensor_shapes, timers=timers)
 
+    # print(losses_reduced)
     return losses_reduced
