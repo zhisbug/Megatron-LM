@@ -418,8 +418,10 @@ def train_step(forward_step_func, data_iterator,
             unwrapped_model = model[0]
         unwrapped_model = unwrap_model(
             unwrapped_model, (torchDDP, LocalDDP, Float16Module))
-
-        if unwrapped_model.share_word_embeddings:
+        rank = torch.distributed.get_rank()
+        if rank == 0:
+            print(">>>>>>>> No tie word embeddings.....")
+        if unwrapped_model.share_word_embeddings and False:
             try:
                 word_embeddings_weight = unwrapped_model.word_embeddings_weight()
                 if args.DDP_impl == 'local':
@@ -428,9 +430,8 @@ def train_step(forward_step_func, data_iterator,
                     grad = word_embeddings_weight.grad
                 torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
             except:
-                rank = torch.distributed.get_rank()
                 if rank == 0:
-                    print(">>>>> This model does not have embeeding, so skip the embedding sync...")
+                    print(">>>>> This model does not have embedding, so skip the embedding sync...")
     timers('backward-embedding-all-reduce').stop()
 
     # Update parameters.
